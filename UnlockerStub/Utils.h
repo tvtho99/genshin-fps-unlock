@@ -1,5 +1,7 @@
 #pragma once
 #include <Windows.h>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <span>
