@@ -29,7 +29,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <None Remove="dm34zubt.k4i~" />
+    <InternalsVisibleTo Include="unlockfps_nc.Tests" />
     <None Remove="Resources\UnlockerStub.dll" />
   </ItemGroup>
 
