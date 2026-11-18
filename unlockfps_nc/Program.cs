@@ -23,15 +23,46 @@ namespace unlockfps_nc
                 return;
             }
 
-            using var mutex = new Mutex(true, MutexName, out var isFirst);
+            // Elevate first so every instance creates/opens the single-instance objects at the
+            // same integrity level; a non-elevated process cannot open the elevated ones.
+            if (!IsAdministrator()) {
+                try {
+                    ProcessStartInfo processInfo = new ProcessStartInfo
+                    {
+                        FileName = Application.ExecutablePath,
+                        UseShellExecute = true,
+                        Verb = "runas"
+                    };
+                    Process.Start(processInfo);
+                }
+                catch {
+                    // ignored: the user declined the UAC prompt
+                }
+
+                return;
+            }
+
+            Mutex instanceMutex;
+            bool isFirst;
+            try {
+                instanceMutex = new Mutex(true, MutexName, out isFirst);
+            }
+            catch (UnauthorizedAccessException) {
+                // another instance owns the mutex at a higher integrity level
+                return;
+            }
+
+            using var mutex = instanceMutex;
 
             if (!isFirst) {
-                // second instance
+                // second instance: ask the first one to show its window
                 try {
                     using var evt = EventWaitHandle.OpenExisting(EventName);
                     evt.Set();
                 }
-                catch { }
+                catch (Exception e) when (e is WaitHandleCannotBeOpenedException or UnauthorizedAccessException) {
+                    // first instance is still starting up or exiting
+                }
                 return;
             }
 
@@ -49,23 +80,6 @@ namespace unlockfps_nc
 
                 }
             });
-
-            if (!IsAdministrator()) {
-                try {
-                    ProcessStartInfo processInfo = new ProcessStartInfo
-                    {
-                        FileName = Application.ExecutablePath,
-                        UseShellExecute = true,
-                        Verb = "runas"
-                    };
-                    Process.Start(processInfo);
-                }
-                catch {
-                    // ignored
-                }
-
-                return;
-            }
 
             var services = new ServiceCollection();
             services.AddTransient<MainForm>();
