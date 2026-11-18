@@ -10,7 +10,7 @@ SELFTEST = utils_selftest.exe
 all: $(DLL)
 
 $(DLL): $(OBJS)
-	$(CXX) -shared -static -static-libgcc -static-libstdc++ -o $@ $^ -Wl,--out-implib,lib$(basename $@).a -lntdll -ldbghelp
+	$(CXX) -shared -static -static-libgcc -static-libstdc++ -o $@ $^ -Wl,--out-implib,lib$(basename $@).a -lntdll
 
 %.o: %.cpp Utils.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@

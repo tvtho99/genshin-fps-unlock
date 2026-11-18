@@ -48,15 +48,12 @@ namespace
 
 std::wstring Utils::GetModulePath(HMODULE hModule)
 {
-    
 	std::wstring path(MAX_PATH, L'\0');
-	auto nChars = GetModuleFileNameW(hModule, path.data(), static_cast<uint32_t>(path.size()));
+	DWORD nChars = 0;
 
-	while (GetLastError() == ERROR_INSUFFICIENT_BUFFER)
-	{
+	// A full buffer means the path was truncated; GetLastError() is not reliable for this.
+	while ((nChars = GetModuleFileNameW(hModule, path.data(), static_cast<DWORD>(path.size()))) == path.size())
 		path.resize(path.size() * 2);
-		nChars = GetModuleFileNameW(hModule, path.data(), static_cast<uint32_t>(path.size()));
-	}
 
 	path.resize(nChars);
 	return path;
@@ -90,10 +87,15 @@ std::vector<uint8_t*> Utils::PatternScanAll(std::span<uint8_t> bytes, const char
 		masks[maskIdx++] = mask;
 	}
 
+	// Every candidate position loads maskCount full 16-byte chunks, so stop where the last load still fits.
+	// ponytail: matches in the last <16 bytes of the span are skipped; section tails are padding in practice.
+	const std::size_t scanLen = maskCount * chunkSize;
+	if (bytes.size() < scanLen) return results;
+
 	__m128i patternFirst16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(patternBytes.data()));
 
 	auto pData = bytes.data();
-	const auto end = pData + bytes.size() - patternMask.size();
+	const auto end = pData + bytes.size() - scanLen;
 
 	while (pData <= end)
 	{
@@ -168,44 +170,47 @@ void Utils::ShowError(const std::wstring& message)
 	MessageBoxW(nullptr, message.c_str(), L"[FPS Unlocker] Error", MB_ICONERROR);
 }
 
+std::pair<uint64_t, uint64_t> Utils::ComputeAllocRange(uint64_t target, uint64_t sysMin, uint64_t sysMax)
+{
+	constexpr uint64_t rel32Reach = 0x7FFFFF00;
+	const uint64_t lower = target > rel32Reach ? target - rel32Reach : 0;
+	const uint64_t upper = target + rel32Reach;
+	return { std::max(lower, sysMin), std::min(upper, sysMax) };
+}
+
 uint8_t* Utils::AllocatePage(uint8_t* desiredAddress, size_t size, DWORD protect)
 {
-	SYSTEM_INFO sysInfo;
+	SYSTEM_INFO sysInfo{};
 	GetSystemInfo(&sysInfo);
-	const uint64_t pageSize = size;
 
-	const auto targetAddr = reinterpret_cast<uint64_t>(desiredAddress);
-	const auto startAddr = (targetAddr & ~(pageSize - 1));
-	const uint64_t minAddr = std::min(startAddr - 0x7FFFFF00, (uint64_t)sysInfo.lpMinimumApplicationAddress);
-	const uint64_t maxAddr = std::max(startAddr + 0x7FFFFF00, (uint64_t)sysInfo.lpMaximumApplicationAddress);
+	// VirtualAlloc rounds reservations down to the allocation granularity (64KB), so step by it.
+	const uint64_t granularity = sysInfo.dwAllocationGranularity;
+	const auto target = reinterpret_cast<uint64_t>(desiredAddress);
+	const auto [lower, upper] = ComputeAllocRange(target,
+		reinterpret_cast<uint64_t>(sysInfo.lpMinimumApplicationAddress),
+		reinterpret_cast<uint64_t>(sysInfo.lpMaximumApplicationAddress));
+	const uint64_t start = target & ~(granularity - 1);
 
-	const uint64_t startPage = (startAddr - (startAddr % pageSize));
-	uint64_t pageOffset = 1;
-
-	while (true)
+	for (uint64_t offset = granularity; ; offset += granularity)
 	{
-		const uint64_t byteOffset = pageOffset * pageSize;
-		const uint64_t highAddr = startPage + byteOffset;
-		const uint64_t lowAddr = (startPage > byteOffset) ? startPage - byteOffset : 0;
+		const uint64_t highAddr = start + offset;
+		const bool highInRange = highAddr + size <= upper;
+		const bool lowInRange = start >= offset && start - offset >= lower;
 
-		const bool needsExit = highAddr > maxAddr && lowAddr < minAddr;
-
-		if (highAddr < maxAddr)
-		{
-			if (void* outAddr = VirtualAlloc((void*)highAddr, pageSize, MEM_COMMIT | MEM_RESERVE, protect))
-				return static_cast<uint8_t*>(outAddr);
-		}
-
-		if (lowAddr > minAddr)
-		{
-			if (void* outAddr = VirtualAlloc((void*)lowAddr, pageSize, MEM_COMMIT | MEM_RESERVE, protect))
-				return static_cast<uint8_t*>(outAddr);
-		}
-
-		pageOffset++;
-
-		if (needsExit)
+		if (!highInRange && !lowInRange)
 			break;
+
+		if (highInRange)
+		{
+			if (void* outAddr = VirtualAlloc(reinterpret_cast<void*>(highAddr), size, MEM_COMMIT | MEM_RESERVE, protect))
+				return static_cast<uint8_t*>(outAddr);
+		}
+
+		if (lowInRange)
+		{
+			if (void* outAddr = VirtualAlloc(reinterpret_cast<void*>(start - offset), size, MEM_COMMIT | MEM_RESERVE, protect))
+				return static_cast<uint8_t*>(outAddr);
+		}
 	}
 
 	return nullptr;
