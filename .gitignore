@@ -371,3 +371,7 @@ UnlockerStub/*.dll
 UnlockerStub/*.a
 UnlockerStub/*.exe
 unlockfps_nc/Resources/UnlockerStub.dll
+
+# Delegation workspace and per-worker build outputs
+.agents/
+.build/
