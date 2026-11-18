@@ -1,8 +1,11 @@
 #pragma once
 #include <Windows.h>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <span>
+#include <utility>
 
 template<typename T, typename Func>
 class MemoryGuard
@@ -31,6 +34,8 @@ namespace Utils
 	void ShowWin32Error(const std::wstring& apiName);
 	void ShowError(const std::wstring& message);
 
+	// [lower, upper] bounds for an allocation that must stay within rel32 reach of target.
+	std::pair<uint64_t, uint64_t> ComputeAllocRange(uint64_t target, uint64_t sysMin, uint64_t sysMax);
 	uint8_t* AllocatePage(uint8_t* desiredAddress, size_t size, DWORD protect);
 
 }

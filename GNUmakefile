@@ -10,4 +10,4 @@ unlockfps_nc/bin/%/net8.0-windows/win-x64/publish/unlockfps_nc.exe : unlockfps_n
 	dotnet publish $< -c $* -r win-x64 -f net8.0-windows --self-contained false -p:PublishSingleFile=true -p:PublishReadyToRun=false
 
 clean :
-	rm -rf UnlockerStub/UnlockerStub.dll unlockfps_nc/Resources/UnlockerStub.dll.dll unlockfps_nc/bin
+	rm -rf UnlockerStub/UnlockerStub.dll unlockfps_nc/Resources/UnlockerStub.dll unlockfps_nc/bin

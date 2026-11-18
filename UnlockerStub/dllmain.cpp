@@ -1,18 +1,18 @@
 // ReSharper disable CppClangTidyMiscUseInternalLinkage
 #include <Windows.h>
-#include <DbgHelp.h>
 #include <ranges>
 #include <algorithm>
+#include <atomic>
+#include <limits>
+#include <thread>
 #include "Utils.h"
 #include "Zydis.h"
 
-#pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "ntdll.lib")
 EXTERN_C NTSTATUS __stdcall LdrAddRefDll(ULONG Flags, PVOID BaseAddress);
 
 namespace
 {
-	HMODULE ModuleBase = nullptr;
 	int32_t* pFramerate = nullptr;
 	HWND GameWindow = nullptr;
 
@@ -21,14 +21,20 @@ namespace
 	uint64_t OriginalBytes = 0;
 	uint8_t* ChangeMobileUI = nullptr;
 
-	enum class IPCStatus : int8_t
+	// Set once the mobile UI hook has run; the trampoline page is freed a while later (see ThreadProc).
+	std::atomic_flag HookFired{};
+	std::atomic<uint64_t> HookFiredTick{ 0 };
+	constexpr uint64_t TrampolineFreeDelayMs = 10000;
+	constexpr size_t FakeObjectSize = 0x1000;
+
+	enum class IPCStatus : int32_t
 	{
 		None,
 		Error,
 		Ready
 	};
 
-	struct __declspec(align(8)) IPCData
+	struct alignas(8) IPCData
 	{
 		IPCStatus Status;
 		int32_t Framerate;
@@ -36,33 +42,12 @@ namespace
 		bool UseMobileUI;
 	};
 
-}
+	// Must match the offsets used by unlockfps_nc/Service/IpcService.cs.
+	static_assert(offsetof(IPCData, Status) == 0);
+	static_assert(offsetof(IPCData, Framerate) == 4);
+	static_assert(offsetof(IPCData, PowerSave) == 8);
+	static_assert(offsetof(IPCData, UseMobileUI) == 9);
 
-LONG __stdcall VectoredExceptionHandler(PEXCEPTION_POINTERS ExceptionInfo)
-{
-	const auto exceptionRecord = ExceptionInfo->ExceptionRecord;
-
-	HMODULE hModule = nullptr;
-	GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(exceptionRecord->ExceptionAddress), &hModule);
-	
-	if (hModule == ModuleBase && 
-		(exceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || exceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION || exceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW))
-	{
-
-		MINIDUMP_EXCEPTION_INFORMATION dumpInfo{};
-		dumpInfo.ThreadId = GetCurrentThreadId();
-		dumpInfo.ExceptionPointers = ExceptionInfo;
-		dumpInfo.ClientPointers = TRUE;
-
-		const auto hFile = CreateFileW(L"crashdump.dmp", GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-		MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hFile, MiniDumpNormal, &dumpInfo, nullptr, nullptr);
-		CloseHandle(hFile);
-
-		Utils::ShowError(L"An unhandled exception has occurred, a crash dump has been saved to crashdump.dmp");
-		ExitThread(1);
-	}
-
-	return EXCEPTION_CONTINUE_SEARCH;
 }
 
 bool SetupData()
@@ -108,6 +93,13 @@ bool SetupData()
 	{
 		const auto disp = *reinterpret_cast<int32_t*>(rip + 1);
 		rip += disp + 5;
+	}
+
+	// Expect "mov dword ptr [rip+disp32], ecx" (89 0D); anything else means the pattern is stale.
+	if (rip[0] != 0x89 || rip[1] != 0x0D)
+	{
+		Utils::ShowError(L"outdated pattern (unexpected instruction)");
+		return false;
 	}
 
 	const auto disp = *reinterpret_cast<int32_t*>(rip + 2);
@@ -162,8 +154,15 @@ bool UninstallHook()
 	return true;
 }
 
-void HookProc(void* rcx)
+uint64_t HookProc(void* rcx)
 {
+	using OriginalFn = uint64_t(*)(void*);
+	const auto original = reinterpret_cast<OriginalFn>(HookHandle);
+
+	// Only the first caller patches the UI; threads that raced into the trampoline just run the original.
+	if (HookFired.test_and_set())
+		return original(rcx);
+
 	ZydisDecoder decoder{};
 	ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
 
@@ -207,9 +206,10 @@ void HookProc(void* rcx)
 		
 	}
 
-	if (offset > 0)
+	// The fake object must hold a pointer at `offset`; anything outside the buffer would corrupt the heap.
+	if (offset > 0 && offset <= FakeObjectSize - sizeof(uint8_t*))
 	{
-		std::vector<uint8_t> buffer(0x1000, 0);
+		std::vector<uint8_t> buffer(FakeObjectSize, 0);
 		*reinterpret_cast<uint8_t**>(buffer.data() + offset) = buffer.data();
 
 		using ChangeMobileUIFn = void(__fastcall*)(uint8_t*);
@@ -217,8 +217,27 @@ void HookProc(void* rcx)
 	}
 
 	UninstallHook();
-	reinterpret_cast<decltype(&HookProc)>(HookHandle)(rcx);
+	const auto result = original(rcx);
+
+	// Freeing the trampoline here would race with threads still executing inside it; ThreadProc frees it later.
+	HookFiredTick = GetTickCount64();
+	return result;
+}
+
+bool FitsRel32(const uint8_t* from, const uint8_t* to)
+{
+	const auto delta = to - from;
+	return delta >= std::numeric_limits<int32_t>::min() && delta <= std::numeric_limits<int32_t>::max();
+}
+
+void FreeTrampolineWhenIdle()
+{
+	const auto firedTick = HookFiredTick.load();
+	if (!HookHandle || firedTick == 0 || GetTickCount64() - firedTick < TrampolineFreeDelayMs)
+		return;
+
 	VirtualFree(HookHandle, 0, MEM_RELEASE);
+	HookHandle = nullptr;
 }
 
 bool InstallHook()
@@ -280,6 +299,8 @@ bool InstallHook()
 		auto status = ZydisDecoderDecodeInstruction(&decoder, &context, rip, ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction);
 		if (!ZYAN_SUCCESS(status))
 		{
+			VirtualFree(HookHandle, 0, MEM_RELEASE);
+			HookHandle = nullptr;
 			Utils::ShowError(L"Failed to decode instruction for hook");
 			return false;
 		}
@@ -293,12 +314,20 @@ bool InstallHook()
 
 	uint8_t* jumpBack = target + offset;
 	uint8_t* jumpBackProc = HookHandle + offset;
+	uint8_t* trampoline = HookHandle + offset + 5;
+
+	if (!FitsRel32(jumpBackProc + 5, jumpBack) || !FitsRel32(target + 5, trampoline))
+	{
+		VirtualFree(HookHandle, 0, MEM_RELEASE);
+		HookHandle = nullptr;
+		Utils::ShowError(L"Hook page is out of rel32 range");
+		return false;
+	}
+
 	int32_t jumpBackDisp = static_cast<int32_t>(jumpBack - (jumpBackProc + 5));
 	jumpBackProc[0] = 0xE9;
 	*reinterpret_cast<int32_t*>(&jumpBackProc[1]) = jumpBackDisp;
-	offset += 5;
 
-	uint8_t* trampoline = HookHandle + offset;
 	trampoline[0] = 0xFF;
 	trampoline[1] = 0x25;
 	*reinterpret_cast<int32_t*>(&trampoline[2]) = 0;
@@ -328,7 +357,6 @@ DWORD __stdcall ThreadProc(LPVOID lpParameter)
 	SetCurrentDirectoryW(processDirectory.c_str());
 
 	LdrAddRefDll(1, lpParameter);
-	//AddVectoredExceptionHandler(1, VectoredExceptionHandler);
 
 	constexpr auto szGuid = "Global\\2DE95FDC-6AB7-4593-BFE6-760DD4AB422B";
 	const auto hMapFile = HandleGuard(OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, szGuid), CloseHandle);
@@ -355,17 +383,19 @@ DWORD __stdcall ThreadProc(LPVOID lpParameter)
 
 	ipcData->Status = IPCStatus::Ready;
 
+	// Install on a separate thread: its error dialogs are modal and must not delay the framerate loop below.
 	if (ipcData->UseMobileUI)
 	{
-		if (!InstallHook())
-		{
-			Utils::ShowError(L"Failed to set mobile UI");
-			return 0;
-		}
+		std::thread([] {
+			if (!InstallHook())
+				Utils::ShowError(L"Failed to set mobile UI");
+		}).detach();
 	}
 
 	while (true)
 	{
+		FreeTrampolineWhenIdle();
+
 		int32_t targetFramerate = ipcData->Framerate;
 
 		if (!GameWindow)
@@ -387,8 +417,6 @@ DWORD __stdcall ThreadProc(LPVOID lpParameter)
 
 BOOL __stdcall DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID lpReserved)
 {
-	ModuleBase = hInstance;
-
 	if (hInstance)
 		DisableThreadLibraryCalls(hInstance);
 

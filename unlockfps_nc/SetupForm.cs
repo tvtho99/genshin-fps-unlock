@@ -53,8 +53,15 @@ namespace unlockfps_nc
 
             while (!_cts.Token.IsCancellationRequested)
             {
-                await Task.Delay(1000);
-                IntPtr windowHandle = IntPtr.Zero;
+                try
+                {
+                    await Task.Delay(1000, _cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
                 IntPtr processHandle = IntPtr.Zero;
                 string processPath = string.Empty;
 
@@ -67,27 +74,44 @@ namespace unlockfps_nc
                     if (sb.ToString() == "UnityWndClass")
                     {
                         Native.GetWindowThreadProcessId(hWnd, out var pid);
-                        processHandle = Native.OpenProcess(
+                        var candidateHandle = Native.OpenProcess(
                             ProcessAccess.QUERY_LIMITED_INFORMATION |
                             ProcessAccess.TERMINATE |
                             StandardAccess.SYNCHRONIZE, false, pid);
-                        var foundPath = ProcessUtils.GetProcessPath(processHandle);
-                        if (!foundPath.Contains("YuanShen.exe") && !foundPath.Contains("GenshinImpact.exe"))
+                        if (candidateHandle == IntPtr.Zero)
                             return true;
 
-                        windowHandle = hWnd;
-                        processPath = foundPath;
-                        return false;
+                        try
+                        {
+                            var foundPath = ProcessUtils.GetProcessPath(candidateHandle);
+                            if (!foundPath.Contains("YuanShen.exe") && !foundPath.Contains("GenshinImpact.exe"))
+                                return true;
+
+                            processHandle = candidateHandle;
+                            processPath = foundPath;
+                            return false;
+                        }
+                        finally
+                        {
+                            if (processHandle != candidateHandle)
+                                Native.CloseHandle(candidateHandle);
+                        }
                     }
 
                     return true;
                 }, IntPtr.Zero);
 
-                if (windowHandle == IntPtr.Zero)
+                if (processHandle == IntPtr.Zero)
                     continue;
 
-                Native.TerminateProcess(processHandle, 0);
-                Native.CloseHandle(processHandle);
+                try
+                {
+                    Native.TerminateProcess(processHandle, 0);
+                }
+                finally
+                {
+                    Native.CloseHandle(processHandle);
+                }
 
                 if (string.IsNullOrEmpty(processPath))
                 {
@@ -100,6 +124,8 @@ namespace unlockfps_nc
                     MessageBoxIcon.Information);
 
                 _config.GamePath = processPath;
+                if (IsDisposed || !IsHandleCreated)
+                    return;
                 Invoke(Close);
             }
 
@@ -124,6 +150,9 @@ namespace unlockfps_nc
                 var path = Path.Combine(installPathCn, "YuanShen.exe");
                 gamePaths.Add(path.Replace('/', '\\'));
             }
+
+            if (IsDisposed || !IsHandleCreated)
+                return;
 
             Invoke(() =>
             {

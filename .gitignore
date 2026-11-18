@@ -365,3 +365,13 @@ FodyWeavers.xsd
 *.dll
 *.lib
 *.exp
+# Native build outputs (MinGW) and embedded stub copy
+UnlockerStub/*.o
+UnlockerStub/*.dll
+UnlockerStub/*.a
+UnlockerStub/*.exe
+unlockfps_nc/Resources/UnlockerStub.dll
+
+# Delegation workspace and per-worker build outputs
+.agents/
+.build/

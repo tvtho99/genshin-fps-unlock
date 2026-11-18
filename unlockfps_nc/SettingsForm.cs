@@ -4,12 +4,12 @@ using System.ComponentModel;
 using System.Data;
 using System.Drawing;
 using System.Linq;
-using System.Reflection.PortableExecutable;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using unlockfps_nc.Model;
 using unlockfps_nc.Service;
+using unlockfps_nc.Utility;
 
 namespace unlockfps_nc
 {
@@ -60,7 +60,7 @@ namespace unlockfps_nc
         private void RefreshDllList()
         {
             _config.DllList = _config.DllList
-                .Where(VerifyDll)
+                .Where(DllValidator.IsNativeX64Dll)
                 .ToList();
 
             ListBoxDlls.Items.Clear();
@@ -70,7 +70,10 @@ namespace unlockfps_nc
         private void UpdateControlState()
         {
             if (_config.PopupWindow) // they can't coexist (?) so disable the other
+            {
                 _config.Fullscreen = false;
+                CBFullscreen.DataBindings["Checked"]?.ReadValue();
+            }
 
             CBPopup.Enabled = !_config.Fullscreen;
             CBFullscreen.Enabled = !_config.PopupWindow;
@@ -101,7 +104,7 @@ namespace unlockfps_nc
             
             var selectedFiles = DllAddDialog.FileNames.ToList();
             selectedFiles = selectedFiles
-                .Where(x => VerifyDll(x) || MessageBox.Show(
+                .Where(x => DllValidator.IsNativeX64Dll(x) || MessageBox.Show(
                     $@"Invalid File: {Environment.NewLine}{x}{Environment.NewLine}{Environment.NewLine}Only native x64 dlls are supported",
                     @"Error", MessageBoxButtons.OK, MessageBoxIcon.Error) != DialogResult.OK)
                 .Where(x => !_config.DllList.Contains(x))
@@ -109,20 +112,6 @@ namespace unlockfps_nc
 
             _config.DllList.AddRange(selectedFiles);
             RefreshDllList();
-        }
-
-        private bool VerifyDll(string fullPath)
-        {
-            if (!File.Exists(fullPath))
-                return false;
-
-            using var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read);
-            using var peReader = new PEReader(fs);
-
-            if (peReader.HasMetadata)
-                return false;
-
-            return peReader.PEHeaders.CoffHeader.Machine == Machine.Amd64;
         }
 
         private void ListBoxDlls_Format(object sender, ListControlConvertEventArgs e)
