@@ -6,7 +6,8 @@ using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading.Tasks;
+using System.Threading;
+using unlockfps_nc.Model;
 using unlockfps_nc.Utility;
 
 namespace unlockfps_nc.Service
@@ -18,20 +19,15 @@ namespace unlockfps_nc.Service
         Ready
     }
 
-    [StructLayout(LayoutKind.Sequential, Pack = 8)]
-    public struct IpcData
-    {
-        public IpcStatus Status;
-        public int Framerate;
-        public bool PowerSave;
-        public bool UseMobileUI;
-    }
-
     public class IpcService(ConfigService configService) : IDisposable
     {
+        internal const int StatusOffset = 0, FramerateOffset = 4, PowerSaveOffset = 8, UseMobileUIOffset = 9;
+
         private MemoryMappedFile? _sharedMemory = null;
         private MemoryMappedViewAccessor? _sharedMemoryAccessor = null;
-        private string _stubPath = string.Empty;
+        // Kept for the service lifetime: the game loads the stub by path whenever the hook fires,
+        // so the file must stay locked against replacement the whole time.
+        private StubFile? _stubFile;
         private ModuleGuard _stubModule = IntPtr.Zero;
         private IntPtr _wndHook = IntPtr.Zero;
 
@@ -46,24 +42,40 @@ namespace unlockfps_nc.Service
 
             Update();
 
-            _sharedMemoryAccessor.Read(0, out IpcData ipcData);
-            if (ipcData.Status == IpcStatus.Ready)
+            var status = ReadStatus(_sharedMemoryAccessor);
+            if (status == IpcStatus.Ready)
                 return true;
-            if (ipcData.Status == IpcStatus.Error)
+            if (status == IpcStatus.Error)
                 return false;
 
-            _stubPath = GetUnlockerStubPath();
-            _stubModule = Native.LoadLibrary(_stubPath);
-            if (_stubModule == IntPtr.Zero)
-            {
-                string errorMessage = $@"Failed to load stub module: {Marshal.GetLastWin32Error()}{Environment.NewLine}{Marshal.GetLastPInvokeErrorMessage()}";
-                MessageBox.Show(errorMessage, @"Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            var targetWindow = ProcessUtils.GetWindowFromProcessId(processId);
+            var threadId = Native.GetWindowThreadProcessId(targetWindow, out uint _);
+            if (threadId == 0)
                 return false;
+
+            if (!_stubModule)
+            {
+                try {
+                    _stubFile ??= StubFile.ExtractEmbedded(AppContext.BaseDirectory);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException) {
+                    MessageBox.Show($@"Failed to extract UnlockerStub.dll:{Environment.NewLine}{e.Message}", @"Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+
+                _stubModule = Native.LoadLibrary(_stubFile.Path);
+                if (!_stubModule)
+                {
+                    string errorMessage = $@"Failed to load stub module: {Marshal.GetLastWin32Error()}{Environment.NewLine}{Marshal.GetLastPInvokeErrorMessage()}";
+                    MessageBox.Show(errorMessage, @"Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
             }
 
             var stubWndProc = Native.GetProcAddress(_stubModule, "WndProc");
-            var targetWindow = ProcessUtils.GetWindowFromProcessId(processId);
-            var threadId = Native.GetWindowThreadProcessId(targetWindow, out uint _);
+            if (_wndHook != IntPtr.Zero)
+                Native.UnhookWindowsHookEx(_wndHook);
 
             _wndHook = Native.SetWindowsHookEx(3, stubWndProc, _stubModule, threadId);
             if (_wndHook == IntPtr.Zero)
@@ -82,12 +94,12 @@ namespace unlockfps_nc.Service
 
             int retryCount = 0;
             while (true) {
-                _sharedMemoryAccessor.Read(0, out ipcData);
+                status = ReadStatus(_sharedMemoryAccessor);
 
-                if (ipcData.Status == IpcStatus.Ready)
+                if (status == IpcStatus.Ready)
                     break;
 
-                if (ipcData.Status == IpcStatus.Error)
+                if (status == IpcStatus.Error)
                     return false;
 
                 if (retryCount >= 20) {
@@ -96,7 +108,7 @@ namespace unlockfps_nc.Service
                 }
 
                 retryCount++;
-                Task.Delay(1000).Wait();
+                Thread.Sleep(1000);
             }
 
             return true;
@@ -104,47 +116,37 @@ namespace unlockfps_nc.Service
 
         public void OnGameExit()
         {
-            var ipcData = new IpcData
-            {
-                Status = IpcStatus.None,
-            };
-
-            _sharedMemoryAccessor?.Write(0, ref ipcData);
+            _sharedMemoryAccessor?.Write(StatusOffset, (int)IpcStatus.None);
         }
 
         public void Update()
         {
-            var ipcData = new IpcData
-            {
-                Framerate = configService.Config.FPSTarget,
-                PowerSave = configService.Config.UsePowerSave,
-                UseMobileUI = configService.Config.UseMobileUI,
-            };
-
-            _sharedMemoryAccessor?.Write(0, ref ipcData);
+            if (_sharedMemoryAccessor != null)
+                WriteSettings(_sharedMemoryAccessor, configService.Config);
         }
 
-        private string GetUnlockerStubPath()
+        internal static void WriteSettings(MemoryMappedViewAccessor accessor, Config config)
         {
-            var assembly = Assembly.GetExecutingAssembly();
-            using var stream = assembly.GetManifestResourceStream("unlockfps_nc.Resources.UnlockerStub.dll");
-
-            var filePath = Path.Combine(AppContext.BaseDirectory, "UnlockerStub.dll");
-
-            try {
-                using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write);
-                stream.CopyTo(fileStream);
-            }
-            catch (Exception) { }
-
-            return filePath;
+            accessor.Write(FramerateOffset, config.FPSTarget);
+            accessor.Write(PowerSaveOffset, config.UsePowerSave);
+            accessor.Write(UseMobileUIOffset, config.UseMobileUI);
         }
+
+        internal static IpcStatus ReadStatus(MemoryMappedViewAccessor accessor)
+            => (IpcStatus)accessor.ReadInt32(StatusOffset);
 
         public void Dispose()
         {
+            if (_wndHook != IntPtr.Zero)
+            {
+                Native.UnhookWindowsHookEx(_wndHook);
+                _wndHook = IntPtr.Zero;
+            }
+
             _sharedMemoryAccessor?.Dispose();
             _sharedMemory?.Dispose();
             _stubModule.Dispose();
+            _stubFile?.Dispose();
         }
     }
 }
