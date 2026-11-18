@@ -17,6 +17,7 @@ namespace unlockfps_nc.Service
         private readonly CancellationTokenSource _cts = new();
         private IntPtr _gameHandle = IntPtr.Zero;
         private int _gamePid = 0;
+        private int _failedPid;
 
         private readonly Config _config;
 
@@ -60,15 +61,18 @@ namespace unlockfps_nc.Service
             }
 
             STARTUPINFO si = new();
+            si.cb = Marshal.SizeOf<STARTUPINFO>();
             uint creationFlag = _config.SuspendLoad ? 4u : 0u;
             var gameFolder = Path.GetDirectoryName(_config.GamePath);
 
-            if (!Native.CreateProcess(_config.GamePath, BuildCommandLine(), IntPtr.Zero, IntPtr.Zero, false, creationFlag, IntPtr.Zero, gameFolder, ref si, out var pi)) {
+            if (!Native.CreateProcess(_config.GamePath, BuildCommandLine(_config), IntPtr.Zero, IntPtr.Zero, false, creationFlag, IntPtr.Zero, gameFolder, ref si, out var pi)) {
                 MessageBox.Show(
                     $@"CreateProcess failed ({Marshal.GetLastWin32Error()}){Environment.NewLine} {Marshal.GetLastPInvokeErrorMessage()}",
                     @"Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
             }
+
+            Native.SetPriorityClass(pi.hProcess, PriorityClassFor(_config.Priority));
 
             if (!ProcessUtils.InjectDlls(pi.hProcess, _config.DllList)) {
                 MessageBox.Show(
@@ -106,48 +110,78 @@ namespace unlockfps_nc.Service
         private async Task UnlockerPoll()
         {
             while (!_cts.IsCancellationRequested) {
-
-                await Task.Delay(1000, _cts.Token);
-                using var process = Process.GetProcesses()
-                    .FirstOrDefault(x => x is { ProcessName: "GenshinImpact" } or { ProcessName: "YuanShen" });
-                if (process == null)
-                    continue;
-
-                while (!ProcessUtils.IsWindowDrawing(process.MainWindowHandle) && !_cts.IsCancellationRequested)
+                try {
                     await Task.Delay(1000, _cts.Token);
+                    var processes = Process.GetProcesses();
+                    if (_failedPid != 0) {
+                        if (processes.Any(candidate => candidate.Id == _failedPid))
+                            continue;
 
-                if (!_ipcService.Start(process.Id))
-                    return;
+                        _failedPid = 0;
+                        _ipcService.OnGameExit();
+                    }
 
-                while (!process.HasExited && !_cts.IsCancellationRequested) {
-                    _ipcService.Update();
-                    await Task.Delay(62, _cts.Token);
+                    using var process = processes
+                        .FirstOrDefault(x => x is { ProcessName: "GenshinImpact" } or { ProcessName: "YuanShen" });
+                    if (process == null)
+                        continue;
+
+                    while (!_cts.IsCancellationRequested && !process.HasExited
+                        && !ProcessUtils.IsWindowDrawing(process.MainWindowHandle))
+                        await Task.Delay(1000, _cts.Token);
+
+                    if (process.HasExited || _cts.IsCancellationRequested)
+                        continue;
+
+                    if (!_ipcService.Start(process.Id)) {
+                        _failedPid = process.Id;
+                        continue;
+                    }
+
+                    while (!process.HasExited && !_cts.IsCancellationRequested) {
+                        _ipcService.Update();
+                        await Task.Delay(62, _cts.Token);
+                    }
+
+                    if (_gameHandle != IntPtr.Zero && _config.AutoClose) {
+                        Application.OpenForms.OfType<MainForm>().FirstOrDefault()?.BeginInvoke(Application.Exit);
+                    }
+
+                    _ipcService.OnGameExit();
+                    await Task.Delay(5000, _cts.Token);
                 }
-
-                if (_gameHandle != IntPtr.Zero && _config.AutoClose) {
-                    Application.Exit();
+                catch (Exception ex) when (ex is not OperationCanceledException) {
+                    Debug.WriteLine(ex);
                 }
-
-                _ipcService.OnGameExit();
-                await Task.Delay(5000, _cts.Token);
             }
         }
 
-        private string BuildCommandLine()
+        internal static uint PriorityClassFor(int priority) => priority switch
         {
-            string commandLine = $"{_config.GamePath} ";
-            if (_config.PopupWindow)
+            0 => 0x100u,
+            1 => 0x80u,
+            2 => 0x8000u,
+            3 => 0x20u,
+            4 => 0x4000u,
+            5 => 0x40u,
+            _ => 0x20u,
+        };
+
+        internal static string BuildCommandLine(Config config)
+        {
+            string commandLine = $"\"{config.GamePath}\" ";
+            if (config.PopupWindow)
                 commandLine += "-popupwindow ";
 
-            if (_config.UseCustomRes)
-                commandLine += $"-screen-width {_config.CustomResX} -screen-height {_config.CustomResY} ";
+            if (config.UseCustomRes)
+                commandLine += $"-screen-width {config.CustomResX} -screen-height {config.CustomResY} ";
 
-            commandLine += $"-screen-fullscreen {(_config.Fullscreen ? 1 : 0)} ";
-            if (_config.Fullscreen)
-                commandLine += $"-window-mode {(_config.IsExclusiveFullscreen ? "exclusive" : "borderless")} ";
+            commandLine += $"-screen-fullscreen {(config.Fullscreen ? 1 : 0)} ";
+            if (config.Fullscreen)
+                commandLine += $"-window-mode {(config.IsExclusiveFullscreen ? "exclusive" : "borderless")} ";
 
-            commandLine += $"-monitor {_config.MonitorNum} ";
-            commandLine += $"{_config.AdditionalCommandLine} ";
+            commandLine += $"-monitor {config.MonitorNum} ";
+            commandLine += $"{config.AdditionalCommandLine} ";
             return commandLine;
         }
 
