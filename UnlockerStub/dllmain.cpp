@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <limits>
+#include <thread>
 #include "Utils.h"
 #include "Zydis.h"
 
@@ -382,9 +383,14 @@ DWORD __stdcall ThreadProc(LPVOID lpParameter)
 
 	ipcData->Status = IPCStatus::Ready;
 
-	// A mobile UI failure must not stop the framerate loop below.
-	if (ipcData->UseMobileUI && !InstallHook())
-		Utils::ShowError(L"Failed to set mobile UI");
+	// Install on a separate thread: its error dialogs are modal and must not delay the framerate loop below.
+	if (ipcData->UseMobileUI)
+	{
+		std::thread([] {
+			if (!InstallHook())
+				Utils::ShowError(L"Failed to set mobile UI");
+		}).detach();
+	}
 
 	while (true)
 	{
