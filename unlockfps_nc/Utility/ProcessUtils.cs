@@ -49,35 +49,57 @@ namespace unlockfps_nc.Utility
             if (dllPaths.Count == 0)
                 return true;
 
-            Native.RtlAdjustPrivilege(20, true, false, out var _);
+            var kernel32 = Native.GetModuleHandle("kernel32.dll");
+            if (kernel32 == IntPtr.Zero)
+                return false;
 
-            var kernel32 = Native.LoadLibrary("kernel32.dll");
             var loadLibrary = Native.GetProcAddress(kernel32, "LoadLibraryW");
+            if (loadLibrary == IntPtr.Zero)
+                return false;
 
-            var remoteVa = Native.VirtualAllocEx(processHandle, IntPtr.Zero, 0x1000,
+            const int bufferSize = 0x1000;
+            const uint waitObject0 = 0;
+            var remoteVa = Native.VirtualAllocEx(processHandle, IntPtr.Zero, bufferSize,
                 AllocationType.COMMIT | AllocationType.RESERVE, MemoryProtection.READWRITE);
             if (remoteVa == IntPtr.Zero)
                 return false;
 
-            foreach (var dllPath in dllPaths)
+            var canFreeRemotePath = true;
+            try
             {
-                var nativeString = Marshal.StringToHGlobalUni(dllPath);
-                var bytes = Encoding.Unicode.GetBytes(dllPath);
-                Marshal.FreeHGlobal(nativeString);
+                foreach (var dllPath in dllPaths)
+                {
+                    if (Encoding.Unicode.GetByteCount(dllPath) > bufferSize - sizeof(char))
+                        return false;
 
-                if (!Native.WriteProcessMemory(processHandle, remoteVa, bytes, bytes.Length, out var bytesWritten))
-                    return false;
+                    var bytes = Encoding.Unicode.GetBytes(dllPath + '\0');
+                    if (!Native.WriteProcessMemory(processHandle, remoteVa, bytes, bytes.Length, out var bytesWritten) ||
+                        bytesWritten != bytes.Length)
+                        return false;
 
-                var thread = Native.CreateRemoteThread(processHandle, IntPtr.Zero, 0, loadLibrary, remoteVa, 0, out var threadId);
-                if (thread == IntPtr.Zero)
-                    return false;
+                    var thread = Native.CreateRemoteThread(processHandle, IntPtr.Zero, 0, loadLibrary, remoteVa, 0, out _);
+                    if (thread == IntPtr.Zero)
+                        return false;
 
-                Native.WaitForSingleObject(thread, uint.MaxValue);
-                Native.CloseHandle(thread);
-                Native.WriteProcessMemory(processHandle, remoteVa, new byte[bytes.Length], bytes.Length, out _);
+                    canFreeRemotePath = false;
+                    try
+                    {
+                        canFreeRemotePath = Native.WaitForSingleObject(thread, 10000) == waitObject0;
+                        if (!canFreeRemotePath || !Native.GetExitCodeThread(thread, out var exitCode) || exitCode == 0)
+                            return false;
+                    }
+                    finally
+                    {
+                        Native.CloseHandle(thread);
+                    }
+                }
             }
-
-            Native.VirtualFreeEx(processHandle, remoteVa, 0, FreeType.RELEASE);
+            finally
+            {
+                // An unsignaled thread may still read the path after the wait returns.
+                if (canFreeRemotePath)
+                    Native.VirtualFreeEx(processHandle, remoteVa, 0, FreeType.RELEASE);
+            }
 #endif
             return true;
         }
