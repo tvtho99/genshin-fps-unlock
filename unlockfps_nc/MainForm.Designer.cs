@@ -101,7 +101,7 @@
             // 
             InputFPS.Location = new Point(47, 31);
             InputFPS.Maximum = new decimal(new int[] { 1000, 0, 0, 0 });
-            InputFPS.Minimum = new decimal(new int[] { 1, 0, 0, 0 });
+            InputFPS.Minimum = new decimal(new int[] { 10, 0, 0, 0 });
             InputFPS.Name = "InputFPS";
             InputFPS.Size = new Size(225, 23);
             InputFPS.TabIndex = 2;
@@ -111,7 +111,7 @@
             // 
             SliderFPS.Location = new Point(12, 60);
             SliderFPS.Maximum = 1000;
-            SliderFPS.Minimum = 1;
+            SliderFPS.Minimum = 10;
             SliderFPS.Name = "SliderFPS";
             SliderFPS.Size = new Size(260, 45);
             SliderFPS.TabIndex = 3;
