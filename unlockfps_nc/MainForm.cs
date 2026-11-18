@@ -3,6 +3,7 @@ using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using unlockfps_nc.Model;
 using unlockfps_nc.Service;
+using unlockfps_nc.Utility;
 
 namespace unlockfps_nc
 {
@@ -150,6 +151,10 @@ namespace unlockfps_nc
                 var remoteVersion = JsonSerializer.Deserialize<VersionInfo>(content);
                 
                 if (remoteVersion == null || remoteVersion.Version <= Program.Version)
+                    return;
+
+                // The URL is opened by an elevated process: refuse anything but a github.com https link.
+                if (!UrlPolicy.IsTrustedReleaseUrl(remoteVersion.Url))
                     return;
 
                 var utcNow = DateTimeOffset.UtcNow;
